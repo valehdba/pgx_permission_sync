@@ -265,4 +265,4 @@ SELECT cron.schedule('pgsync-cleanup', '0 3 * * *',
 
 ## License
 
-MIT
+PostgreSQL License
