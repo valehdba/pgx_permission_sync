@@ -1,0 +1,8 @@
+# pgx_permission_sync extension
+comment = 'Synchronize user permissions across PostgreSQL environments'
+default_version = '1.0'
+module_pathname = '$libdir/pgx_permission_sync'
+schema = dba_pgx_permission_sync
+relocatable = false
+requires = 'dblink,pgcrypto'
+superuser = true
