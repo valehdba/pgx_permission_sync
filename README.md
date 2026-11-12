@@ -6,7 +6,7 @@ A PostgreSQL extension that automatically synchronizes role and permission chang
 
 ### Prerequisites
 
-- PostgreSQL 12+
+- PostgreSQL 14+
 - `pgcrypto` and `dblink` extensions (auto-installed as dependencies)
 - Superuser access on the source database
 - The sync user on each target must have `CREATEROLE` and relevant `GRANT` privileges
@@ -16,7 +16,7 @@ A PostgreSQL extension that automatically synchronizes role and permission chang
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_ORG/pgx_permission_sync.git
+git clone https://github.com/valehdba/pgx_permission_sync.git
 cd pgx_permission_sync
 
 # Build and install (requires pg_config in PATH)
@@ -24,6 +24,14 @@ make install
 
 # Or specify pg_config location
 make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+```
+
+### Upgrade from 1.0
+
+```sql
+ALTER EXTENSION pgx_permission_sync UPDATE TO '1.1';
+-- Then set a real encryption key (re-encrypts stored environment passwords):
+SELECT dba_pgx_permission_sync.set_encryption_key('at-least-16-characters-long');
 ```
 
 ### Enable in your database
@@ -39,12 +47,29 @@ SELECT * FROM dba_pgx_permission_sync.extension_metadata;
 ### Uninstall
 
 ```sql
--- First drop event triggers and roles (they are cluster-wide)
-\i /path/to/sql/uninstall.sql
-
--- Then drop the extension
+-- 1. Drop the extension (this also removes its event triggers)
 DROP EXTENSION pgx_permission_sync CASCADE;
+
+-- 2. Optionally drop the cluster-wide pgsync_* roles
+\i /path/to/sql/uninstall.sql
 ```
+
+---
+
+## Known limitations
+
+- **CREATE ROLE / ALTER ROLE / DROP ROLE are not replicated.** Roles are shared
+  (cluster-wide) objects and PostgreSQL does not allow event triggers for them.
+  Replicated today: `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, policies and
+  schema commands, plus anything sent through `manual_sync()`. Role replication
+  is planned (reconcile / `ProcessUtility` hook).
+- Sync runs synchronously inside the DDL transaction; an unreachable target
+  slows the originating statement down (async outbox is planned).
+- `GRANT`/`REVOKE` rules cannot match on the grantee yet; `role_pattern` only
+  applies to role commands.
+- `dblink` and `pgcrypto` are located via their install schema when the
+  extension is created; re-run the search_path block at the end of
+  `pgx_permission_sync--1.0--1.1.sql` if you relocate either one.
 
 ---
 
@@ -153,6 +178,7 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 | `permission_audit_log` | Immutable audit trail of all permission DDL |
 | `retry_queue` | Failed executions queued for retry |
 | `config` | Runtime configuration key-value store |
+| `secrets` | Encryption key (no role except the owner can read it) |
 
 ### Key columns in `sync_execution_log`
 
@@ -180,6 +206,7 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 | `enable_sync()` / `disable_sync()` | Master switch |
 | `enable_dry_run()` / `disable_dry_run()` | Log without executing |
 | `manual_sync(sql, env?)` | Ad-hoc sync to all or one environment |
+| `set_encryption_key(key)` | Rotate the key and re-encrypt stored passwords (admin only) |
 | `process_retry_queue()` | Re-attempt failed syncs |
 | `cleanup_old_logs()` | Purge old records per retention config |
 | `get_sync_status(hours?)` | Quick dashboard |
@@ -226,7 +253,7 @@ VALUES (4, 'exclude', '^test_.*');
 | `statement_timeout_ms` | `30000` | Statement timeout (ms) |
 | `log_retention_days` | `90` | Sync log retention |
 | `audit_retention_days` | `365` | Audit log retention |
-| `encrypt_passwords` | `true` | Encrypt stored passwords |
+| `encrypt_passwords` | `true` | Encrypt stored passwords (key lives in the restricted `secrets` table; rotate with `set_encryption_key()`) |
 | `dry_run` | `false` | Log only, don't execute |
 | `notify_on_failure` | `true` | pg_notify on failure |
 | `excluded_roles` | `postgres,replication,pg_*` | Never-sync patterns |
@@ -239,7 +266,10 @@ VALUES (4, 'exclude', '^test_.*');
 |---|---|
 | `pgsync_admin` | Full control |
 | `pgsync_operator` | View logs, manual sync, test connections, process retries |
-| `pgsync_reader` | Read-only access |
+| `pgsync_reader` | Read-only access (cannot see stored passwords or raw retry SQL) |
+
+Passwords in SQL text (`PASSWORD '...'`) are masked in `sync_batches`,
+`sync_execution_log`, `permission_audit_log` and `pg_notify` payloads.
 
 ```sql
 GRANT pgsync_admin TO dba_lead;
