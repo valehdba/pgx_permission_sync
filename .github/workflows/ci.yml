@@ -24,11 +24,18 @@ jobs:
           sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
       - name: Build, install, test
         run: |
-          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          sudo -E make install
-          sudo service postgresql start || true
-          sudo -u postgres /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctlcluster ${{ matrix.pg }} main start 2>/dev/null || true
-          sudo -u postgres env PATH=/usr/lib/postgresql/${{ matrix.pg }}/bin:$PATH make installcheck
+          PGBIN=/usr/lib/postgresql/${{ matrix.pg }}/bin
+          MK="make PG_CONFIG=$PGBIN/pg_config"
+          sudo $MK install
+
+          # private throwaway cluster owned by the runner user
+          $PGBIN/initdb -D "$RUNNER_TEMP/pgdata" -U postgres -A trust >/dev/null
+          $PGBIN/pg_ctl -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" -w \
+            -o "-p 55432 -k /tmp -c listen_addresses=''" start
+
+          $MK installcheck PGHOST=/tmp PGPORT=55432 PGUSER=postgres
       - name: Show diffs on failure
         if: failure()
-        run: cat regression.diffs 2>/dev/null || true
+        run: |
+          cat regression.diffs 2>/dev/null || true
+          cat "$RUNNER_TEMP/pg.log" 2>/dev/null | tail -50 || true

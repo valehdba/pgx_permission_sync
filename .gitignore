@@ -19,3 +19,6 @@ Thumbs.db
 *~
 .vscode/
 .idea/
+results/
+regression.diffs
+regression.out
