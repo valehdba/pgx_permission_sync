@@ -1,29 +1,28 @@
 -- ============================================================================
--- pgx_permission_sync  --  uninstall (run before DROP EXTENSION if needed)
+-- pgx_permission_sync  --  post-uninstall role cleanup
 --
--- Event triggers are NOT schema-scoped, so they must be dropped explicitly
--- before DROP EXTENSION can succeed.  Run this script, then:
---     DROP EXTENSION pgx_permission_sync CASCADE;
+-- Usage (order matters):
+--     DROP EXTENSION pgx_permission_sync CASCADE;   -- removes event triggers too
+--     \i sql/uninstall.sql                          -- drops the cluster-wide roles
+--
+-- The event triggers are members of the extension and cannot be dropped on
+-- their own; DROP EXTENSION removes them.
+--
+-- Roles are cluster-wide. If the extension is installed in several databases,
+-- run DROP EXTENSION in all of them first, otherwise DROP ROLE fails with
+-- "role ... cannot be dropped because some objects depend on it".
 -- ============================================================================
 
-DROP EVENT TRIGGER IF EXISTS pgsync_ddl_command_end;
-DROP EVENT TRIGGER IF EXISTS pgsync_sql_drop;
-
--- Roles are cluster-wide; clean them up if no longer needed
-DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='pgsync_reader') THEN
-        REASSIGN OWNED BY pgsync_reader   TO postgres;
-        DROP OWNED BY pgsync_reader;
-        DROP ROLE pgsync_reader;
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='pgsync_operator') THEN
-        REASSIGN OWNED BY pgsync_operator TO postgres;
-        DROP OWNED BY pgsync_operator;
-        DROP ROLE pgsync_operator;
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='pgsync_admin') THEN
-        REASSIGN OWNED BY pgsync_admin    TO postgres;
-        DROP OWNED BY pgsync_admin;
-        DROP ROLE pgsync_admin;
-    END IF;
+DO $$
+DECLARE
+    v_role TEXT;
+BEGIN
+    FOREACH v_role IN ARRAY ARRAY['pgsync_reader','pgsync_operator','pgsync_admin']
+    LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+            EXECUTE format('REASSIGN OWNED BY %I TO %I', v_role, current_user);
+            EXECUTE format('DROP OWNED BY %I', v_role);
+            EXECUTE format('DROP ROLE %I', v_role);
+        END IF;
+    END LOOP;
 END $$;

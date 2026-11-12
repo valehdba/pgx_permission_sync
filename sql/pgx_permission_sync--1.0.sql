@@ -782,7 +782,8 @@ DROP EVENT TRIGGER IF EXISTS pgsync_sql_drop;
 CREATE EVENT TRIGGER pgsync_ddl_command_end
     ON ddl_command_end
     WHEN TAG IN (
-        'CREATE ROLE','ALTER ROLE','DROP ROLE',
+        -- CREATE/ALTER/DROP ROLE are shared objects: PostgreSQL rejects event
+        -- triggers for them ("event triggers are not supported for CREATE ROLE")
         'GRANT','REVOKE',
         'CREATE POLICY','ALTER POLICY','DROP POLICY',
         'ALTER DEFAULT PRIVILEGES','CREATE SCHEMA','ALTER SCHEMA')
