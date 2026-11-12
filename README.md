@@ -26,10 +26,10 @@ make install
 make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
 ```
 
-### Upgrade from 1.0
+### Upgrade
 
 ```sql
-ALTER EXTENSION pgx_permission_sync UPDATE TO '1.1';
+ALTER EXTENSION pgx_permission_sync UPDATE TO '1.2';   -- from 1.0 or 1.1
 -- Then set a real encryption key (re-encrypts stored environment passwords):
 SELECT dba_pgx_permission_sync.set_encryption_key('at-least-16-characters-long');
 ```
@@ -58,11 +58,16 @@ DROP EXTENSION pgx_permission_sync CASCADE;
 
 ## Known limitations
 
-- **CREATE ROLE / ALTER ROLE / DROP ROLE are not replicated.** Roles are shared
-  (cluster-wide) objects and PostgreSQL does not allow event triggers for them.
-  Replicated today: `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, policies and
-  schema commands, plus anything sent through `manual_sync()`. Role replication
-  is planned (reconcile / `ProcessUtility` hook).
+- **CREATE ROLE / ALTER ROLE / DROP ROLE are not replicated live.** Roles are
+  shared (cluster-wide) objects and PostgreSQL does not allow event triggers for
+  them. Live replication covers `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`,
+  policies and schema commands, plus anything sent through `manual_sync()`.
+  Roles are handled by [drift detection and `reconcile()`](#drift-detection--reconcile):
+  missing roles are created (without passwords), attributes and memberships are
+  aligned. Roles are never dropped automatically.
+- Drift detection does not compare object ownership, database-level privileges,
+  large objects, role passwords / per-role settings, or the PG16+ `INHERIT` /
+  `SET` membership options.
 - Sync runs synchronously inside the DDL transaction; an unreachable target
   slows the originating statement down (async outbox is planned).
 - `GRANT`/`REVOKE` rules cannot match on the grantee yet; `role_pattern` only
@@ -137,6 +142,56 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 
 ---
 
+## Drift detection & reconcile
+
+Live sync only helps for changes made while the extension is watching. Drift
+detection compares the **source** with each environment, so you can find (and
+fix) anything that diverged: missed events, failed retries, changes made
+directly on a target, roles created before the extension was installed.
+
+```sql
+-- Compare the source with one environment / all of them
+SELECT dba_pgx_permission_sync.detect_drift('prod');
+SELECT * FROM dba_pgx_permission_sync.detect_drift_all();
+
+SELECT * FROM dba_pgx_permission_sync.v_drift_latest;       -- one row per environment
+SELECT * FROM dba_pgx_permission_sync.v_drift_open_items;   -- what is different + the fix SQL
+
+-- Show what reconcile WOULD run (default: dry run, nothing is changed)
+SELECT kind, drift_type, action, status, fix_sql
+FROM dba_pgx_permission_sync.reconcile('prod');
+
+-- Apply the missing / changed grants and roles
+SELECT * FROM dba_pgx_permission_sync.reconcile('prod', p_dry_run => false);
+
+-- ...and also revoke what the target has but the source does not
+SELECT * FROM dba_pgx_permission_sync.reconcile('prod', false, p_allow_revoke => true);
+```
+
+**What is compared:** roles and their attributes, role memberships, table /
+column / sequence / schema / function privileges, and default privileges.
+
+**Safety model**
+
+| Rule | Behaviour |
+|---|---|
+| Dry run first | `reconcile()` changes nothing unless `p_dry_run => false` (the global `dry_run` setting also forces a dry run) |
+| No drops | Roles that exist only on the target are *report only*; a role is never dropped |
+| Revokes are opt-in | Privileges only the target has are revoked only with `p_allow_revoke => true` |
+| Privileged roles | `SUPERUSER`, `REPLICATION`, `BYPASSRLS` are not given to target roles unless `reconcile_allow_superuser = 'true'` (item is `blocked`) |
+| Missing objects | A grant on a table / schema that does not exist on the target is `blocked`, not attempted |
+| Passwords | Never read or copied; new roles are created without a password |
+| Audit | Every applied statement is logged in `sync_execution_log` under a `RECONCILE` batch, and a `verify` run is recorded afterwards |
+| Access | `pgsync_operator` can run `detect_drift*`; only `pgsync_admin` can `reconcile()` |
+
+An unreachable environment is recorded as a run with `status = 'error'` rather
+than raising, so a scheduled `detect_drift_all()` always completes.
+
+Drift results are also published on the `notify_channel` (`drift_detected`) when
+`notify_on_drift = 'true'`.
+
+---
+
 ## Architecture
 
 ```
@@ -178,6 +233,7 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 | `permission_audit_log` | Immutable audit trail of all permission DDL |
 | `retry_queue` | Failed executions queued for retry |
 | `config` | Runtime configuration key-value store |
+| `drift_runs` / `drift_items` | Drift check history and the individual differences |
 | `secrets` | Encryption key (no role except the owner can read it) |
 
 ### Key columns in `sync_execution_log`
@@ -206,6 +262,8 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 | `enable_sync()` / `disable_sync()` | Master switch |
 | `enable_dry_run()` / `disable_dry_run()` | Log without executing |
 | `manual_sync(sql, env?)` | Ad-hoc sync to all or one environment |
+| `detect_drift(env)` / `detect_drift_all()` | Compare the source with one / all environments |
+| `reconcile(env, dry_run?, allow_revoke?)` | Show / apply the SQL that removes the drift |
 | `set_encryption_key(key)` | Rotate the key and re-encrypt stored passwords (admin only) |
 | `process_retry_queue()` | Re-attempt failed syncs |
 | `cleanup_old_logs()` | Purge old records per retention config |
@@ -223,6 +281,8 @@ SELECT * FROM dba_pgx_permission_sync.v_failed_syncs;
 | `v_failed_syncs` | Failed executions with retry status |
 | `v_audit_trail` | Audit log with sync outcome |
 | `v_sync_daily_summary` | Aggregated daily statistics |
+| `v_drift_latest` | Latest drift run per environment |
+| `v_drift_open_items` | Differences in the latest drift run, with fix SQL |
 
 ---
 
@@ -257,6 +317,9 @@ VALUES (4, 'exclude', '^test_.*');
 | `dry_run` | `false` | Log only, don't execute |
 | `notify_on_failure` | `true` | pg_notify on failure |
 | `excluded_roles` | `postgres,replication,pg_*` | Never-sync patterns |
+| `reconcile_excluded_schemas` | `pg_catalog,information_schema,pg_toast,<extension schema>` | Schemas ignored by drift detection |
+| `reconcile_allow_superuser` | `false` | Allow reconcile to grant `SUPERUSER` / `REPLICATION` / `BYPASSRLS` |
+| `notify_on_drift` | `true` | `pg_notify` when drift is found |
 
 ---
 
@@ -285,6 +348,10 @@ GRANT pgsync_reader TO dev_lead;
 -- Retry queue every 2 minutes
 SELECT cron.schedule('pgsync-retries', '*/2 * * * *',
     $$SELECT * FROM dba_pgx_permission_sync.process_retry_queue()$$);
+
+-- Drift check every night at 2 AM (alert via the notify channel)
+SELECT cron.schedule('pgsync-drift', '0 2 * * *',
+    $$SELECT * FROM dba_pgx_permission_sync.detect_drift_all()$$);
 
 -- Cleanup daily at 3 AM
 SELECT cron.schedule('pgsync-cleanup', '0 3 * * *',
