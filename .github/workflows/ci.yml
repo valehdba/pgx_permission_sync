@@ -1,0 +1,34 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  regress:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
+      - name: Build, install, test
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          sudo -E make install
+          sudo service postgresql start || true
+          sudo -u postgres /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctlcluster ${{ matrix.pg }} main start 2>/dev/null || true
+          sudo -u postgres env PATH=/usr/lib/postgresql/${{ matrix.pg }}/bin:$PATH make installcheck
+      - name: Show diffs on failure
+        if: failure()
+        run: cat regression.diffs 2>/dev/null || true
